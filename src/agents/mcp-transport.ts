@@ -42,6 +42,16 @@ const GNAME_MCP_SERVER_NAME = "gname";
 const GNAME_DYNAMIC_HEADER_NAME = "x-gn-skw";
 const GNAME_DYNAMIC_HEADER_ENDPOINT = "http://127.0.0.1:8095";
 const GNAME_DYNAMIC_HEADER_TIMEOUT_MS = 5_000;
+const GNAME_DYNAMIC_HEADER_DENYLIST = new Set([
+  "connection",
+  "content-length",
+  "host",
+  "mcp-session-id",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
 
 function attachStderrLogging(serverName: string, transport: OpenClawStdioClientTransport) {
   const stderr = transport.stderr;
@@ -117,21 +127,54 @@ function readRequestUrl(input: RequestInfo | URL): string {
   return input instanceof URL ? input.toString() : input;
 }
 
-function readDynamicGnameHeaderValue(body: unknown): string | undefined {
-  if (typeof body === "string") {
-    return normalizeOptionalString(body);
-  }
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    return undefined;
-  }
-  const record = body as Record<string, unknown>;
-  for (const key of [GNAME_DYNAMIC_HEADER_NAME, "skw", "value"]) {
-    const value = record[key];
-    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-      return normalizeOptionalString(String(value));
-    }
+function normalizeDynamicHeaderValue(value: unknown): string | undefined {
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return normalizeOptionalString(String(value));
   }
   return undefined;
+}
+
+function isSafeDynamicHeader(name: string, value: string): boolean {
+  const normalizedName = name.toLowerCase();
+  if (GNAME_DYNAMIC_HEADER_DENYLIST.has(normalizedName)) {
+    logWarn(`bundle-mcp: ignored forbidden gname dynamic header ${normalizedName}.`);
+    return false;
+  }
+  try {
+    new Headers([[name, value]]);
+    return true;
+  } catch {
+    logWarn(`bundle-mcp: ignored invalid gname dynamic header ${normalizedName}.`);
+    return false;
+  }
+}
+
+function readDynamicGnameHeaders(body: unknown): Record<string, string> {
+  if (typeof body === "string") {
+    const value = normalizeOptionalString(body);
+    return value ? { [GNAME_DYNAMIC_HEADER_NAME]: value } : {};
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return {};
+  }
+  const record = body as Record<string, unknown>;
+  const dynamicHeaders: Record<string, string> = {};
+  if (record.headers && typeof record.headers === "object" && !Array.isArray(record.headers)) {
+    for (const [name, rawValue] of Object.entries(record.headers as Record<string, unknown>)) {
+      const value = normalizeDynamicHeaderValue(rawValue);
+      if (value && isSafeDynamicHeader(name, value)) {
+        dynamicHeaders[name] = value;
+      }
+    }
+  }
+  for (const key of [GNAME_DYNAMIC_HEADER_NAME, "skw", "value"]) {
+    const value = normalizeDynamicHeaderValue(record[key]);
+    if (value && isSafeDynamicHeader(GNAME_DYNAMIC_HEADER_NAME, value)) {
+      dynamicHeaders[GNAME_DYNAMIC_HEADER_NAME] = value;
+      break;
+    }
+  }
+  return dynamicHeaders;
 }
 
 async function fetchDynamicGnameHeader(params: {
@@ -141,7 +184,7 @@ async function fetchDynamicGnameHeader(params: {
   method: string;
   mcpSessionId?: string;
   sessionContext?: McpTransportSessionContext;
-}): Promise<string | undefined> {
+}): Promise<Record<string, string>> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), GNAME_DYNAMIC_HEADER_TIMEOUT_MS);
   timer.unref?.();
@@ -172,25 +215,22 @@ async function fetchDynamicGnameHeader(params: {
     });
     if (!response.ok) {
       logWarn(
-        `bundle-mcp: gname dynamic header endpoint returned HTTP ${response.status}; ${GNAME_DYNAMIC_HEADER_NAME} was not attached.`,
+        `bundle-mcp: gname dynamic header endpoint returned HTTP ${response.status}; dynamic headers were not attached.`,
       );
-      return undefined;
+      return {};
     }
     const contentType = response.headers.get("content-type") ?? "";
-    const value = readDynamicGnameHeaderValue(
+    const dynamicHeaders = readDynamicGnameHeaders(
       contentType.includes("application/json") ? await response.json() : await response.text(),
     );
-    if (!value) {
-      logWarn(
-        `bundle-mcp: gname dynamic header endpoint returned no usable ${GNAME_DYNAMIC_HEADER_NAME} value.`,
-      );
+    if (Object.keys(dynamicHeaders).length === 0) {
+      logWarn("bundle-mcp: gname dynamic header endpoint returned no usable headers.");
     }
-    return value;
+    return dynamicHeaders;
   } catch (error) {
-    logWarn(
-      `bundle-mcp: failed to resolve ${GNAME_DYNAMIC_HEADER_NAME} for gname MCP request: ${String(error)}`,
-    );
-    return undefined;
+    const errorName = error instanceof Error ? error.name : "unknown";
+    logWarn(`bundle-mcp: failed to resolve gname dynamic headers for MCP request: ${errorName}`);
+    return {};
   } finally {
     clearTimeout(timer);
   }
@@ -212,7 +252,7 @@ function withGnameDynamicHeader(params: {
       return await params.fetchFn(url, init);
     }
     const headers = readRequestHeaders(url, init);
-    const value = await fetchDynamicGnameHeader({
+    const dynamicHeaders = await fetchDynamicGnameHeader({
       serverName: params.serverName,
       resourceUrl: params.resourceUrl,
       requestUrl,
@@ -220,8 +260,8 @@ function withGnameDynamicHeader(params: {
       mcpSessionId: headers.get("mcp-session-id") ?? undefined,
       sessionContext: params.sessionContext,
     });
-    if (value) {
-      headers.set(GNAME_DYNAMIC_HEADER_NAME, value);
+    for (const [name, value] of Object.entries(dynamicHeaders)) {
+      headers.set(name, value);
     }
     return await params.fetchFn(url, { ...(init as RequestInit), headers });
   };

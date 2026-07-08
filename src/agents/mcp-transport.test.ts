@@ -336,7 +336,7 @@ describe("resolveMcpTransport", () => {
   it("adds the dynamic gname header to streamable HTTP requests", async () => {
     runtimeFetchMock
       .mockResolvedValueOnce(
-        new Response(JSON.stringify({ skw: "dynamic-secret" }), {
+        new Response(JSON.stringify({ headers: { "x-gn-skw": "dynamic-secret" } }), {
           headers: { "content-type": "application/json" },
         }),
       )
@@ -381,6 +381,63 @@ describe("resolveMcpTransport", () => {
     const sentHeaders = new Headers(runtimeFetchCall(1)?.[1]?.headers);
     expect(sentHeaders.get("x-gn-skw")).toBe("dynamic-secret");
     expect(sentHeaders.get("mcp-session-id")).toBe("session-123");
+  });
+
+  it("merges gname dynamic headers without replacing the MCP session header", async () => {
+    runtimeFetchMock
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            headers: {
+              Authorization: "Bearer tenant-token",
+              "X-Tenant": "tenant-a",
+              "mcp-session-id": "bad-session",
+            },
+          }),
+          {
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(new Response("ok"));
+
+    resolveMcpTransport("gname", {
+      url: "https://mcp.example.com/mcp",
+      transport: "streamable-http",
+    });
+
+    const options = latestStreamableTransportOptions();
+    await options.fetch?.("https://mcp.example.com/mcp", {
+      method: "POST",
+      headers: {
+        "mcp-session-id": "session-123",
+      },
+    });
+
+    const sentHeaders = new Headers(runtimeFetchCall(1)?.[1]?.headers);
+    expect(sentHeaders.get("authorization")).toBe("Bearer tenant-token");
+    expect(sentHeaders.get("x-tenant")).toBe("tenant-a");
+    expect(sentHeaders.get("mcp-session-id")).toBe("session-123");
+  });
+
+  it("keeps the legacy gname dynamic header response format", async () => {
+    runtimeFetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ skw: "legacy-secret" }), {
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(new Response("ok"));
+
+    resolveMcpTransport("gname", {
+      url: "https://mcp.example.com/mcp",
+      transport: "streamable-http",
+    });
+
+    await latestStreamableFetch()("https://mcp.example.com/mcp");
+
+    const sentHeaders = new Headers(runtimeFetchCall(1)?.[1]?.headers);
+    expect(sentHeaders.get("x-gn-skw")).toBe("legacy-secret");
   });
 
   it("does not call the gname dynamic header endpoint for other servers", async () => {

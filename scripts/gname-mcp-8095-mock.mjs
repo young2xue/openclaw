@@ -42,10 +42,12 @@ const server = http.createServer(async (req, res) => {
 
     console.log("\n[gname-mcp-mock] received request");
     console.log(JSON.stringify(payload, null, 2));
-    console.log(`[gname-mcp-mock] returning x-gn-skw=${skw}`);
+    console.log("[gname-mcp-mock] returning headers: x-gn-skw");
 
     jsonResponse(res, 200, {
-      "x-gn-skw": skw,
+      headers: {
+        "x-gn-skw": skw,
+      },
     });
   } catch (error) {
     console.error("[gname-mcp-mock] request failed:", error);
