@@ -1628,6 +1628,7 @@ export async function runEmbeddedAttempt(
       ? await getOrCreateSessionMcpRuntime({
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
+          sandboxSessionKey,
           workspaceDir: effectiveWorkspace,
           cfg: params.config,
         })

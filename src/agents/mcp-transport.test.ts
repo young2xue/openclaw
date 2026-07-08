@@ -333,6 +333,71 @@ describe("resolveMcpTransport", () => {
     expect(new Headers(runtimeFetchCall(1)?.[1]?.headers).get("x-tenant")).toBeNull();
   });
 
+  it("adds the dynamic gname header to streamable HTTP requests", async () => {
+    runtimeFetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ skw: "dynamic-secret" }), {
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(new Response("ok"));
+
+    resolveMcpTransport(
+      "gname",
+      {
+        url: "https://mcp.example.com/mcp",
+        transport: "streamable-http",
+      },
+      {
+        agentSessionId: "agent-session-789",
+        agentSessionKey: "agent:main:chat-456",
+        sandboxSessionKey: "agent:main:sandbox:chat-456",
+      },
+    );
+
+    const options = latestStreamableTransportOptions();
+    await options.fetch?.("https://mcp.example.com/mcp", {
+      method: "POST",
+      headers: {
+        "mcp-session-id": "session-123",
+      },
+    });
+
+    expect(runtimeFetchMock).toHaveBeenCalledTimes(2);
+    expect(runtimeFetchCall(0)?.[0]).toBe("http://127.0.0.1:8095");
+    expect(runtimeFetchCall(0)?.[1]?.method).toBe("POST");
+    expect(JSON.parse(String(runtimeFetchCall(0)?.[1]?.body))).toEqual({
+      serverName: "gname",
+      resourceUrl: "https://mcp.example.com/mcp",
+      requestUrl: "https://mcp.example.com/mcp",
+      method: "POST",
+      sessionId: "session-123",
+      mcpSessionId: "session-123",
+      agentSessionId: "agent-session-789",
+      agentSessionKey: "agent:main:chat-456",
+      sandboxSessionKey: "agent:main:sandbox:chat-456",
+    });
+
+    const sentHeaders = new Headers(runtimeFetchCall(1)?.[1]?.headers);
+    expect(sentHeaders.get("x-gn-skw")).toBe("dynamic-secret");
+    expect(sentHeaders.get("mcp-session-id")).toBe("session-123");
+  });
+
+  it("does not call the gname dynamic header endpoint for other servers", async () => {
+    runtimeFetchMock.mockResolvedValueOnce(new Response("ok"));
+
+    resolveMcpTransport("probe", {
+      url: "https://mcp.example.com/mcp",
+      transport: "streamable-http",
+    });
+
+    const options = latestStreamableTransportOptions();
+    await options.fetch?.("https://mcp.example.com/mcp");
+
+    expect(runtimeFetchMock).toHaveBeenCalledTimes(1);
+    expect(runtimeFetchCall(0)?.[0]).toBe("https://mcp.example.com/mcp");
+  });
+
   it("merges SSE event-source headers case-insensitively so auth is not duplicated", async () => {
     // The SDK's EventSource can supply lowercase `authorization` while operator
     // config uses `Authorization`; the runtime fetch should see one header.

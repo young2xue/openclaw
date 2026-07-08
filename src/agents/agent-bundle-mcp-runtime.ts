@@ -521,6 +521,7 @@ function resolveSessionMcpRuntimeIdleTtlMs(cfg?: OpenClawConfig): number {
 export function createSessionMcpRuntime(params: {
   sessionId: string;
   sessionKey?: string;
+  sandboxSessionKey?: string;
   workspaceDir: string;
   cfg?: OpenClawConfig;
   manifestRegistry?: Pick<PluginManifestRegistry, "plugins">;
@@ -655,7 +656,11 @@ export function createSessionMcpRuntime(params: {
         }> = [];
         for (const [serverName, rawServer] of Object.entries(loaded.mcpServers)) {
           failIfDisposed();
-          const resolved = resolveMcpTransport(serverName, rawServer);
+          const resolved = resolveMcpTransport(serverName, rawServer, {
+            agentSessionId: params.sessionId,
+            agentSessionKey: params.sessionKey,
+            sandboxSessionKey: params.sandboxSessionKey,
+          });
           if (!resolved) {
             continue;
           }
@@ -1156,6 +1161,7 @@ function createSessionMcpRuntimeManager(
         createRuntime({
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
+          sandboxSessionKey: params.sandboxSessionKey,
           workspaceDir: params.workspaceDir,
           cfg: params.cfg,
           configFingerprint: nextFingerprint,
@@ -1239,6 +1245,7 @@ export function getSessionMcpRuntimeManager(): SessionMcpRuntimeManager {
 export async function getOrCreateSessionMcpRuntime(params: {
   sessionId: string;
   sessionKey?: string;
+  sandboxSessionKey?: string;
   workspaceDir: string;
   cfg?: OpenClawConfig;
 }): Promise<SessionMcpRuntime> {

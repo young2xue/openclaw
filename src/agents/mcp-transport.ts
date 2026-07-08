@@ -11,7 +11,8 @@ import {
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { FetchLike, Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import { logDebug } from "../logger.js";
+import { loadUndiciRuntimeDeps } from "../infra/net/undici-runtime.js";
+import { logDebug, logWarn } from "../logger.js";
 import {
   buildMcpHttpFetch,
   withoutMcpAuthorizationHeader,
@@ -30,6 +31,17 @@ type ResolvedMcpTransport = {
   supportsParallelToolCalls: boolean;
   detachStderr?: () => void;
 };
+
+type McpTransportSessionContext = {
+  agentSessionId?: string;
+  agentSessionKey?: string;
+  sandboxSessionKey?: string;
+};
+
+const GNAME_MCP_SERVER_NAME = "gname";
+const GNAME_DYNAMIC_HEADER_NAME = "x-gn-skw";
+const GNAME_DYNAMIC_HEADER_ENDPOINT = "http://127.0.0.1:8095";
+const GNAME_DYNAMIC_HEADER_TIMEOUT_MS = 5_000;
 
 function attachStderrLogging(serverName: string, transport: OpenClawStdioClientTransport) {
   const stderr = transport.stderr;
@@ -85,10 +97,141 @@ function buildSseEventSourceFetch(
   };
 }
 
+function readRequestMethod(init?: RequestInit): string {
+  const method = normalizeOptionalString(init?.method);
+  return method ? method.toUpperCase() : "GET";
+}
+
+function readRequestHeaders(input: RequestInfo | URL, init?: RequestInit): Headers {
+  const headers = new Headers(input instanceof Request ? input.headers : undefined);
+  for (const [key, value] of new Headers(init?.headers)) {
+    headers.set(key, value);
+  }
+  return headers;
+}
+
+function readRequestUrl(input: RequestInfo | URL): string {
+  if (input instanceof Request) {
+    return input.url;
+  }
+  return input instanceof URL ? input.toString() : input;
+}
+
+function readDynamicGnameHeaderValue(body: unknown): string | undefined {
+  if (typeof body === "string") {
+    return normalizeOptionalString(body);
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return undefined;
+  }
+  const record = body as Record<string, unknown>;
+  for (const key of [GNAME_DYNAMIC_HEADER_NAME, "skw", "value"]) {
+    const value = record[key];
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      return normalizeOptionalString(String(value));
+    }
+  }
+  return undefined;
+}
+
+async function fetchDynamicGnameHeader(params: {
+  serverName: string;
+  resourceUrl: string;
+  requestUrl: string;
+  method: string;
+  mcpSessionId?: string;
+  sessionContext?: McpTransportSessionContext;
+}): Promise<string | undefined> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GNAME_DYNAMIC_HEADER_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const response = await loadUndiciRuntimeDeps().fetch(GNAME_DYNAMIC_HEADER_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        serverName: params.serverName,
+        resourceUrl: params.resourceUrl,
+        requestUrl: params.requestUrl,
+        method: params.method,
+        ...(params.mcpSessionId ? { sessionId: params.mcpSessionId } : {}),
+        ...(params.mcpSessionId ? { mcpSessionId: params.mcpSessionId } : {}),
+        ...(params.sessionContext?.agentSessionId
+          ? { agentSessionId: params.sessionContext.agentSessionId }
+          : {}),
+        ...(params.sessionContext?.agentSessionKey
+          ? { agentSessionKey: params.sessionContext.agentSessionKey }
+          : {}),
+        ...(params.sessionContext?.sandboxSessionKey
+          ? { sandboxSessionKey: params.sessionContext.sandboxSessionKey }
+          : {}),
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      logWarn(
+        `bundle-mcp: gname dynamic header endpoint returned HTTP ${response.status}; ${GNAME_DYNAMIC_HEADER_NAME} was not attached.`,
+      );
+      return undefined;
+    }
+    const contentType = response.headers.get("content-type") ?? "";
+    const value = readDynamicGnameHeaderValue(
+      contentType.includes("application/json") ? await response.json() : await response.text(),
+    );
+    if (!value) {
+      logWarn(
+        `bundle-mcp: gname dynamic header endpoint returned no usable ${GNAME_DYNAMIC_HEADER_NAME} value.`,
+      );
+    }
+    return value;
+  } catch (error) {
+    logWarn(
+      `bundle-mcp: failed to resolve ${GNAME_DYNAMIC_HEADER_NAME} for gname MCP request: ${String(error)}`,
+    );
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function withGnameDynamicHeader(params: {
+  serverName: string;
+  resourceUrl: string;
+  fetchFn: FetchLike;
+  sessionContext?: McpTransportSessionContext;
+}): FetchLike {
+  if (params.serverName !== GNAME_MCP_SERVER_NAME) {
+    return params.fetchFn;
+  }
+  const resourceOrigin = new URL(params.resourceUrl).origin;
+  return async (url, init) => {
+    const requestUrl = readRequestUrl(url);
+    if (new URL(requestUrl).origin !== resourceOrigin) {
+      return await params.fetchFn(url, init);
+    }
+    const headers = readRequestHeaders(url, init);
+    const value = await fetchDynamicGnameHeader({
+      serverName: params.serverName,
+      resourceUrl: params.resourceUrl,
+      requestUrl,
+      method: readRequestMethod(init),
+      mcpSessionId: headers.get("mcp-session-id") ?? undefined,
+      sessionContext: params.sessionContext,
+    });
+    if (value) {
+      headers.set(GNAME_DYNAMIC_HEADER_NAME, value);
+    }
+    return await params.fetchFn(url, { ...(init as RequestInit), headers });
+  };
+}
+
 /** Resolves a configured MCP server into a live SDK transport instance. */
 export function resolveMcpTransport(
   serverName: string,
   rawServer: unknown,
+  sessionContext?: McpTransportSessionContext,
 ): ResolvedMcpTransport | null {
   const resolved = resolveMcpTransportConfig(serverName, rawServer);
   if (!resolved) {
@@ -136,11 +279,17 @@ export function resolveMcpTransport(
           resourceUrl: resolved.url,
         })
       : baseFetch;
+  const streamableHttpFetch = withGnameDynamicHeader({
+    serverName,
+    resourceUrl: resolved.url,
+    fetchFn: httpFetch,
+    sessionContext,
+  });
   if (resolved.transportType === "streamable-http") {
     return {
       transport: new StreamableHTTPClientTransport(new URL(resolved.url), {
         requestInit: resolved.auth === "oauth" || !headers ? undefined : { headers },
-        fetch: httpFetch,
+        fetch: streamableHttpFetch,
         authProvider,
       }),
       description: resolved.description,
