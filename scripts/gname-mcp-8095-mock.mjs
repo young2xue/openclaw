@@ -4,6 +4,7 @@ import http from "node:http";
 const HOST = process.env.GNAME_MCP_MOCK_HOST ?? "127.0.0.1";
 const PORT = Number.parseInt(process.env.GNAME_MCP_MOCK_PORT ?? "8095", 10);
 const STATIC_SKW = process.env.GNAME_MCP_MOCK_SKW ?? "mock-x-gn-skw";
+const STATIC_TOKEN = process.env.GNAME_MCP_MOCK_TOKEN ?? "mock-tenant-token";
 
 function readRequestBody(req) {
   return new Promise((resolve, reject) => {
@@ -42,10 +43,11 @@ const server = http.createServer(async (req, res) => {
 
     console.log("\n[gname-mcp-mock] received request");
     console.log(JSON.stringify(payload, null, 2));
-    console.log("[gname-mcp-mock] returning headers: x-gn-skw");
+    console.log("[gname-mcp-mock] returning headers: authorization, x-gn-skw");
 
     jsonResponse(res, 200, {
       headers: {
+        Authorization: `Bearer ${STATIC_TOKEN}`,
         "x-gn-skw": skw,
       },
     });
@@ -61,6 +63,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`[gname-mcp-mock] listening on http://${HOST}:${PORT}`);
   console.log("[gname-mcp-mock] override value with GNAME_MCP_MOCK_SKW=your-secret");
+  console.log("[gname-mcp-mock] override token with GNAME_MCP_MOCK_TOKEN=tenant-token");
 });
 
 process.on("SIGINT", () => {

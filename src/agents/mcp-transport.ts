@@ -40,6 +40,7 @@ type McpTransportSessionContext = {
 
 const GNAME_MCP_SERVER_NAME = "gname";
 const GNAME_DYNAMIC_HEADER_NAME = "x-gn-skw";
+const GNAME_DYNAMIC_AUTHORIZATION_HEADER_NAME = "authorization";
 const GNAME_DYNAMIC_HEADER_ENDPOINT = "http://127.0.0.1:8095";
 const GNAME_DYNAMIC_HEADER_TIMEOUT_MS = 5_000;
 const GNAME_DYNAMIC_HEADER_DENYLIST = new Set([
@@ -260,6 +261,16 @@ function withGnameDynamicHeader(params: {
       mcpSessionId: headers.get("mcp-session-id") ?? undefined,
       sessionContext: params.sessionContext,
     });
+    const dynamicAuthorization = Object.entries(dynamicHeaders).find(
+      ([name]) => name.toLowerCase() === GNAME_DYNAMIC_AUTHORIZATION_HEADER_NAME,
+    )?.[1];
+    // Tenant auth has no shared fallback: sending without the 8095 result can
+    // authorize one conversation with another tenant's configured credential.
+    if (!dynamicAuthorization) {
+      throw new Error(
+        "bundle-mcp: gname dynamic Authorization unavailable; MCP request blocked to preserve session isolation",
+      );
+    }
     for (const [name, value] of Object.entries(dynamicHeaders)) {
       headers.set(name, value);
     }
@@ -309,8 +320,13 @@ export function resolveMcpTransport(
     clientKey: resolved.clientKey,
     resourceUrl: resolved.url,
   });
+  const requiresDynamicGnameAuthorization =
+    serverName === GNAME_MCP_SERVER_NAME && resolved.transportType === "streamable-http";
+  // A configured gname token must never survive as a fallback when 8095 fails.
   const headers =
-    resolved.auth === "oauth" ? withoutMcpAuthorizationHeader(resolved.headers) : resolved.headers;
+    resolved.auth === "oauth" || requiresDynamicGnameAuthorization
+      ? withoutMcpAuthorizationHeader(resolved.headers)
+      : resolved.headers;
   const httpFetch =
     resolved.auth === "oauth"
       ? withSameOriginMcpHttpHeaders({

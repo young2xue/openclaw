@@ -928,6 +928,7 @@ export function createSessionMcpRuntime(params: {
   return {
     sessionId: params.sessionId,
     sessionKey: params.sessionKey,
+    sandboxSessionKey: params.sandboxSessionKey,
     workspaceDir: params.workspaceDir,
     configFingerprint,
     createdAt,
@@ -1044,6 +1045,8 @@ function createSessionMcpRuntimeManager(
     string,
     {
       promise: Promise<SessionMcpRuntime>;
+      sessionKey?: string;
+      sandboxSessionKey?: string;
       workspaceDir: string;
       configFingerprint: string;
     }
@@ -1131,11 +1134,19 @@ function createSessionMcpRuntimeManager(
       });
       const existing = runtimesBySessionId.get(params.sessionId);
       if (existing) {
+        // Transport closures retain tenant session context. Rebuild whenever
+        // that identity changes so MCP sessions and dynamic auth cannot cross tenants.
         if (
+          existing.sessionKey !== params.sessionKey ||
+          existing.sandboxSessionKey !== params.sandboxSessionKey ||
           existing.workspaceDir !== params.workspaceDir ||
           existing.configFingerprint !== nextFingerprint
         ) {
           runtimesBySessionId.delete(params.sessionId);
+          forgetSessionKeysForSessionId(params.sessionId);
+          if (params.sessionKey) {
+            sessionIdBySessionKey.set(params.sessionKey, params.sessionId);
+          }
           await existing.dispose();
         } else {
           existing.markUsed();
@@ -1146,12 +1157,18 @@ function createSessionMcpRuntimeManager(
       const inFlight = createInFlight.get(params.sessionId);
       if (inFlight) {
         if (
+          inFlight.sessionKey === params.sessionKey &&
+          inFlight.sandboxSessionKey === params.sandboxSessionKey &&
           inFlight.workspaceDir === params.workspaceDir &&
           inFlight.configFingerprint === nextFingerprint
         ) {
           return inFlight.promise;
         }
         createInFlight.delete(params.sessionId);
+        forgetSessionKeysForSessionId(params.sessionId);
+        if (params.sessionKey) {
+          sessionIdBySessionKey.set(params.sessionKey, params.sessionId);
+        }
         const staleRuntime = await inFlight.promise.catch(() => undefined);
         runtimesBySessionId.delete(params.sessionId);
         idleTtlMsBySessionId.delete(params.sessionId);
@@ -1174,6 +1191,8 @@ function createSessionMcpRuntimeManager(
       });
       createInFlight.set(params.sessionId, {
         promise: created,
+        sessionKey: params.sessionKey,
+        sandboxSessionKey: params.sandboxSessionKey,
         workspaceDir: params.workspaceDir,
         configFingerprint: nextFingerprint,
       });

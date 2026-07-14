@@ -1525,6 +1525,7 @@ process.on("SIGINT", shutdown);`,
         ...runtime,
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
+        sandboxSessionKey: params.sandboxSessionKey,
         workspaceDir: params.workspaceDir,
         configFingerprint: params.configFingerprint ?? "fingerprint",
         dispose: async () => {
@@ -1582,6 +1583,42 @@ process.on("SIGINT", shutdown);`,
 
     expect(disposed).toEqual(["session-a", "session-a"]);
     expect(manager.listSessionIds()).not.toContain("session-a");
+  });
+
+  it("recreates a session runtime when its tenant session context changes", async () => {
+    const disposed: string[] = [];
+    const createRuntime: RuntimeFactory = (params) => ({
+      ...makeRuntime([{ toolName: "bundle_probe", description: "Bundle MCP probe" }]),
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      sandboxSessionKey: params.sandboxSessionKey,
+      workspaceDir: params.workspaceDir,
+      configFingerprint: params.configFingerprint ?? "fingerprint",
+      dispose: async () => {
+        disposed.push(`${params.sessionKey}:${params.sandboxSessionKey}`);
+      },
+    });
+    const manager = testing.createSessionMcpRuntimeManager({ createRuntime });
+
+    const runtimeA = await manager.getOrCreate({
+      sessionId: "shared-session-id",
+      sessionKey: "agent:tenant-a:chat",
+      sandboxSessionKey: "agent:tenant-a:sandbox",
+      workspaceDir: "/workspace",
+    });
+    const runtimeB = await manager.getOrCreate({
+      sessionId: "shared-session-id",
+      sessionKey: "agent:tenant-b:chat",
+      sandboxSessionKey: "agent:tenant-b:sandbox",
+      workspaceDir: "/workspace",
+    });
+
+    expect(runtimeB).not.toBe(runtimeA);
+    expect(runtimeB.sessionKey).toBe("agent:tenant-b:chat");
+    expect(runtimeB.sandboxSessionKey).toBe("agent:tenant-b:sandbox");
+    expect(manager.peekSession({ sessionKey: "agent:tenant-a:chat" })).toBeUndefined();
+    expect(manager.peekSession({ sessionKey: "agent:tenant-b:chat" })).toBe(runtimeB);
+    expect(disposed).toEqual(["agent:tenant-a:chat:agent:tenant-a:sandbox"]);
   });
 
   it("peeks existing runtimes and populated catalogs without creating new runtimes", async () => {

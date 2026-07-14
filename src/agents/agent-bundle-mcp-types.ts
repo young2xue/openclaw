@@ -66,6 +66,7 @@ export type McpToolCatalogDiagnostic = {
 export type SessionMcpRuntime = {
   sessionId: string;
   sessionKey?: string;
+  sandboxSessionKey?: string;
   workspaceDir: string;
   configFingerprint: string;
   createdAt: number;

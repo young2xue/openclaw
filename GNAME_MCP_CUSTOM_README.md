@@ -31,12 +31,13 @@ POST http://127.0.0.1:8095
 - 返回 `Authorization`，让不同客户共用一个 OpenClaw 进程时，按当前用户会话注入各自的
   MCP token。
 
-当前实现是 fail-open：
+当前实现对租户认证是 fail-closed：
 
-- 8095 服务不可用时，不阻断 MCP 请求。
-- 8095 返回非 2xx 时，不阻断 MCP 请求。
-- 8095 返回空值或无法解析时，不阻断 MCP 请求。
-- 上述情况只记录 warning，MCP 请求会继续发送，但不会带动态请求头。
+- 每个 `gname` 同源 MCP 请求都必须从 8095 获取有效的 `Authorization`。
+- 8095 服务不可用、返回非 2xx、响应无法解析或未返回 `Authorization` 时，当前 MCP
+  请求会被阻断。
+- `gname` 配置中的静态 `Authorization` 会被移除，不能作为动态认证失败时的回退。
+- `x-gn-skw` 仍然是可选 header；只缺少 `x-gn-skw` 不会阻断请求。
 - 日志只记录状态、header 名或错误类型，不记录 8095 返回的 header 值，避免 token 泄露。
 
 ## 修改过的文件
@@ -45,6 +46,8 @@ POST http://127.0.0.1:8095
   - 增加只针对 `gname` 的 Streamable HTTP fetch wrapper。
   - 在同源 MCP 请求前调用 `http://127.0.0.1:8095`。
   - 从 8095 响应中读取动态请求头，并合并到 MCP 请求头。
+  - 要求 8095 为每个请求返回动态 `Authorization`，缺失时阻断 MCP 请求。
+  - 删除 `gname` 配置中的静态 `Authorization`，禁止共享 token 回退。
   - 把 MCP session、agent session、sandbox session 信息放进 8095 请求体。
   - 拒绝 8095 覆盖 `mcp-session-id`、`content-length`、`host` 等协议/传输级 header。
   - warning 日志不打印 token 或动态 header 值。
@@ -52,6 +55,8 @@ POST http://127.0.0.1:8095
 - `src/agents/agent-bundle-mcp-runtime.ts`
   - 在创建 MCP transport 时，把当前 OpenClaw 会话上下文传下去。
   - 传递字段包括 `agentSessionId`、`agentSessionKey`、`sandboxSessionKey`。
+  - 同一 `sessionId` 的 `agentSessionKey` 或 `sandboxSessionKey` 变化时，销毁旧 runtime
+    并创建新的 MCP transport，避免沿用旧客户的认证上下文和 MCP session。
 
 - `src/agents/agent-bundle-mcp-types.ts`
   - 给 `SessionMcpRuntimeManager.getOrCreate(...)` 参数增加可选字段
@@ -64,8 +69,12 @@ POST http://127.0.0.1:8095
   - 增加测试，确认 `gname` 请求会调用 8095 并追加 `x-gn-skw`。
   - 增加测试，确认 8095 返回的 `headers` 会合并到 MCP 请求。
   - 增加测试，确认 8095 不能替换当前 MCP 请求的 `mcp-session-id`。
+  - 增加测试，确认 8095 未返回动态 `Authorization` 时不会发出 MCP 请求。
   - 增加测试，确认非 `gname` 的 MCP server 不会调用 8095。
   - 测试覆盖 8095 请求体中的 MCP session、agent session、sandbox session 字段。
+
+- `src/agents/agent-bundle-mcp-runtime.test.ts`
+  - 增加测试，确认同一 `sessionId` 的会话 key 变化时会重建 runtime。
 
 ## 8095 请求体格式
 
@@ -151,7 +160,8 @@ OpenClaw 会把 `headers` 里的可用字段合并进当前 MCP 请求头。head
 原因是这些字段属于 MCP session 或 HTTP 传输层，允许动态服务覆盖会导致会话串租、
 请求体长度错误或代理行为异常。
 
-为了兼容最早的本地版本，也仍然支持直接返回纯文本：
+`Authorization` 是必需字段。为了兼容最早的本地版本，`x-gn-skw` 也仍然支持直接返回
+纯文本：
 
 ```text
 dynamic-secret
@@ -173,21 +183,26 @@ dynamic-secret
 { "value": "dynamic-secret" }
 ```
 
-这些兼容格式都会被转换成 MCP 请求头：
+这些兼容格式都会被转换成 MCP 请求头，但它们只提供 `x-gn-skw`，不能替代必需的
+`headers.Authorization`：
 
 ```http
 x-gn-skw: dynamic-secret
 ```
 
-生产环境如果要按客户注入 MCP token，建议使用 `headers.Authorization`：
+生产环境必须按客户注入 `headers.Authorization`：
 
 ```json
 {
   "headers": {
-    "Authorization": "Bearer customer-specific-token"
+    "Authorization": "Bearer customer-specific-token",
+    "x-gn-skw": "optional-dynamic-value"
   }
 }
 ```
+
+不要在 `gname` 的 OpenClaw MCP 配置中保留共享静态 `Authorization`。当前实现会忽略它，
+并且不会在 8095 失败时回退到共享 token。
 
 注意：8095 服务可以打印收到的 session 参数用于排查，但不要打印返回的 token/header 值。
 仓库里的 mock 脚本只打印返回的 header 名，不打印 `x-gn-skw` 的值。
@@ -217,6 +232,7 @@ http://127.0.0.1:8095
 ```json
 {
   "headers": {
+    "Authorization": "Bearer mock-tenant-token",
     "x-gn-skw": "mock-x-gn-skw:gname:<mcpSessionId>"
   }
 }
@@ -226,6 +242,12 @@ http://127.0.0.1:8095
 
 ```sh
 GNAME_MCP_MOCK_SKW=test-secret node scripts/gname-mcp-8095-mock.mjs
+```
+
+可以用环境变量改模拟租户 token：
+
+```sh
+GNAME_MCP_MOCK_TOKEN=test-tenant-token node scripts/gname-mcp-8095-mock.mjs
 ```
 
 也可以改监听地址和端口：
@@ -292,7 +314,12 @@ git diff --check
 
 ```text
 src/agents/mcp-transport.test.ts
-14 tests passed
+15 tests passed
+
+src/agents/agent-bundle-mcp-runtime.test.ts
+42 tests passed
+
+合计 57 tests passed
 ```
 
 `autoreview` 也尝试运行过，但当前环境调用 OpenAI API 时被网络/区域 403 拦截，
@@ -305,6 +332,6 @@ src/agents/mcp-transport.test.ts
 - 如果 8095 地址变化，需要改 `GNAME_DYNAMIC_HEADER_ENDPOINT`。
 - 如果 8095 返回 JSON 字段变化，需要改 `readDynamicGnameHeaders(...)`。
 - 如果要允许或禁止更多动态 header，需要改 `GNAME_DYNAMIC_HEADER_DENYLIST`。
-- 如果希望 8095 失败时阻断 MCP 请求，需要把当前 fail-open 行为改成抛错。
+- 租户 `Authorization` 当前固定为 fail-closed，不应改回共享 token 回退。
 - 如果需要把这套逻辑做成通用配置项，建议不要继续硬编码 `gname`，而是新增正式的
   MCP server 配置字段和 schema；当前文件只是本地定制说明。
